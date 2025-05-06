@@ -91,8 +91,8 @@ public class TokenBloomFilterFileIndex implements FileIndexer {
 
         @Override
         public void write(Object key) {
-            if (key != null && key instanceof String) {
-                String text = (String) key;
+            if (key != null && key instanceof BinaryString) {
+                String text = key.toString();
                 Arrays.stream(text.split(delimiter))
                         .filter(token -> !token.isEmpty())
                         .forEach(
@@ -138,8 +138,8 @@ public class TokenBloomFilterFileIndex implements FileIndexer {
             if (key == null) {
                 return REMAIN;
             }
-            if (key instanceof String) {
-                String text = (String) key;
+            if (key instanceof BinaryString) {
+                String text = key.toString();
                 boolean anyTokenMatch =
                         Arrays.stream(text.split(delimiter))
                                 .filter(token -> !token.isEmpty())
