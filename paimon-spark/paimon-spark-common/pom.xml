@@ -70,8 +70,8 @@ under the License.
 
         <dependency>
             <groupId>org.apache.datafusion</groupId>
-            <artifactId>comet-spark-spark3.5_2.12</artifactId>
-            <version>0.11.0</version>
+            <artifactId>comet-spark-spark3.5_${scala.binary.version}</artifactId>
+            <version>0.8.1</version>
             <scope>provided</scope>
             <exclusions>
                 <exclusion>
