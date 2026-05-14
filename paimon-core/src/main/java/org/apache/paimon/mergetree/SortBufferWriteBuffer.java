@@ -60,6 +60,7 @@ public class SortBufferWriteBuffer implements WriteBuffer {
     private final RowType keyType;
     private final RowType valueType;
     private final KeyValueSerializer serializer;
+    private final int pageSize;
     private final SortBuffer buffer;
 
     public SortBufferWriteBuffer(
@@ -107,6 +108,7 @@ public class SortBufferWriteBuffer implements WriteBuffer {
             throw new IllegalArgumentException(
                     "Write buffer requires a minimum of 3 page memory, please increase write buffer memory size.");
         }
+        this.pageSize = memoryPool.pageSize();
         InternalRowSerializer serializer =
                 InternalSerializers.create(KeyValue.schema(keyType, valueType));
         BinaryInMemorySortBuffer inMemorySortBuffer =
@@ -126,10 +128,49 @@ public class SortBufferWriteBuffer implements WriteBuffer {
                         : inMemorySortBuffer;
     }
 
+    static void throwIfPageSizeCannotHoldFixedLengthPart(
+            int keyFieldCount, int valueFieldCount, int pageSize, @Nullable Throwable cause) {
+        int fieldCount = keyFieldCount + 2 + valueFieldCount;
+        int serializedFixedLengthPartSize =
+                BinaryRow.calculateFixPartSizeInBytes(fieldCount)
+                        + BinaryRowSerializer.LENGTH_SIZE_IN_BYTES;
+        if (serializedFixedLengthPartSize <= pageSize) {
+            return;
+        }
+
+        String message =
+                String.format(
+                        "BinaryRow fixed-length part size %s for %s fields exceeds current page-size %s. "
+                                + "This can make wide-table writes fail later with unexpected errors such as "
+                                + "NegativeArraySizeException. Please increase the 'page-size' table option "
+                                + "to at least %s bytes.",
+                        new MemorySize(serializedFixedLengthPartSize).toHumanReadableString(),
+                        fieldCount,
+                        new MemorySize(pageSize).toHumanReadableString(),
+                        serializedFixedLengthPartSize);
+        throw cause == null
+                ? new IllegalArgumentException(message)
+                : new IllegalArgumentException(message, cause);
+    }
+
+    private void throwIfPageSizeCannotHoldFixedLengthPart(@Nullable Throwable cause) {
+        throwIfPageSizeCannotHoldFixedLengthPart(
+                keyType.getFieldCount(), valueType.getFieldCount(), pageSize, cause);
+    }
+
     @Override
     public boolean put(long sequenceNumber, RowKind valueKind, InternalRow key, InternalRow value)
             throws IOException {
-        return buffer.write(serializer.toRow(key, sequenceNumber, valueKind, value));
+        try {
+            boolean success = buffer.write(serializer.toRow(key, sequenceNumber, valueKind, value));
+            if (!success) {
+                throwIfPageSizeCannotHoldFixedLengthPart(null);
+            }
+            return success;
+        } catch (IOException e) {
+            throwIfPageSizeCannotHoldFixedLengthPart(e);
+            throw e;
+        }
     }
 
     @Override
