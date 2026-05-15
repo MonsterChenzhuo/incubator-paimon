@@ -113,4 +113,46 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
       }
     }
   }
+
+  test("Paimon export parquet procedure: roll files by target file size") {
+    val random = ThreadLocalRandom.current().nextInt(100000)
+    withTable(s"tbl_roll$random") {
+      sql(s"""
+             |CREATE TABLE tbl_roll$random (
+             |  id INT,
+             |  name STRING
+             |)
+             |""".stripMargin)
+
+      sql(s"""
+             |INSERT INTO tbl_roll$random VALUES
+             |  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')
+             |""".stripMargin)
+
+      withTempDir {
+        dir =>
+          val output = new File(dir, "export-roll").getAbsolutePath
+
+          checkAnswer(
+            spark.sql(s"""
+                         |CALL sys.export_parquet(
+                         |  table => 'tbl_roll$random',
+                         |  columns => '*',
+                         |  output_path => '$output',
+                         |  target_file_size => '1 b',
+                         |  parallelism => 1)
+                         |""".stripMargin),
+            Row(true, 5L) :: Nil
+          )
+
+          assertThat(new File(output).listFiles().filter(_.getName.endsWith(".parquet")).length)
+            .isGreaterThan(1)
+
+          val exported = spark.read.parquet(output)
+          checkAnswer(
+            exported.orderBy("id"),
+            Row(1, "a") :: Row(2, "b") :: Row(3, "c") :: Row(4, "d") :: Row(5, "e") :: Nil)
+      }
+    }
+  }
 }

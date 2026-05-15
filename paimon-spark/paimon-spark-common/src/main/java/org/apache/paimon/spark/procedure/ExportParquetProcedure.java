@@ -24,6 +24,8 @@ import org.apache.paimon.format.parquet.ParquetWriterFactory;
 import org.apache.paimon.format.parquet.writer.RowDataParquetBuilder;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
@@ -70,6 +72,8 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -103,7 +107,8 @@ public class ExportParquetProcedure extends BaseProcedure {
                 ProcedureParameter.optional("where", StringType),
                 ProcedureParameter.optional("parallelism", IntegerType),
                 ProcedureParameter.optional("compression", StringType),
-                ProcedureParameter.optional("overwrite", BooleanType)
+                ProcedureParameter.optional("overwrite", BooleanType),
+                ProcedureParameter.optional("target_file_size", StringType)
             };
 
     private static final StructType OUTPUT_TYPE =
@@ -139,11 +144,20 @@ public class ExportParquetProcedure extends BaseProcedure {
                         : Math.max(1, args.getInt(4));
         String compression = args.isNullAt(5) ? "zstd" : args.getString(5);
         boolean overwrite = !args.isNullAt(6) && args.getBoolean(6);
+        Long targetFileSize = args.isNullAt(7) ? null : parseTargetFileSize(args.getString(7));
 
         Table table = loadSparkTable(tableIdent).getTable();
         try {
             long rows =
-                    export(table, columns, outputPath, where, parallelism, compression, overwrite);
+                    export(
+                            table,
+                            columns,
+                            outputPath,
+                            where,
+                            parallelism,
+                            compression,
+                            overwrite,
+                            targetFileSize);
             return new InternalRow[] {newInternalRow(true, rows)};
         } catch (Exception e) {
             throw new RuntimeException("Failed to export parquet files", e);
@@ -157,7 +171,8 @@ public class ExportParquetProcedure extends BaseProcedure {
             @Nullable String where,
             int parallelism,
             String compression,
-            boolean overwrite)
+            boolean overwrite,
+            @Nullable Long targetFileSize)
             throws Exception {
         RowType tableRowType = table.rowType();
         int[] outputProjection = parseOutputProjection(tableRowType, columns);
@@ -182,8 +197,9 @@ public class ExportParquetProcedure extends BaseProcedure {
         readBuilder = readBuilder.withProjection(readProjection);
 
         final ReadBuilder finalReadBuilder = readBuilder;
+        List<Split> plannedSplits = finalReadBuilder.newScan().plan().splits();
         final List<SerializedSplit> splits =
-                finalReadBuilder.newScan().plan().splits().stream()
+                plannedSplits.stream()
                         .map(ExportParquetProcedure::copySplit)
                         .map(ExportParquetProcedure::serializeSplit)
                         .collect(Collectors.toList());
@@ -196,23 +212,45 @@ public class ExportParquetProcedure extends BaseProcedure {
         final Predicate finalProjectedPredicate = projectedPredicate;
         final int outputFieldCount = outputProjection.length;
         final String finalCompression = compression;
+        final Long finalTargetFileSize = targetFileSize;
+        final int numPartitions =
+                numPartitions(parallelism, splits.size(), plannedSplits, targetFileSize);
         JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark().sparkContext());
-        List<Long> counts =
-                jsc.parallelize(
-                                splits,
-                                Math.max(1, Math.min(parallelism, Math.max(1, splits.size()))))
-                        .map(
-                                serializedSplit ->
-                                        exportSplit(
-                                                exportTable,
-                                                finalReadBuilder,
-                                                serializedSplit.split(),
-                                                outputDir,
-                                                finalOutputType,
-                                                finalProjectedPredicate,
-                                                outputFieldCount,
-                                                finalCompression))
-                        .collect();
+        List<Long> counts;
+        if (targetFileSize == null) {
+            counts =
+                    jsc.parallelize(splits, numPartitions)
+                            .map(
+                                    serializedSplit ->
+                                            exportSplit(
+                                                    exportTable,
+                                                    finalReadBuilder,
+                                                    serializedSplit.split(),
+                                                    outputDir,
+                                                    finalOutputType,
+                                                    finalProjectedPredicate,
+                                                    outputFieldCount,
+                                                    finalCompression))
+                            .collect();
+        } else {
+            counts =
+                    jsc.parallelize(splits, numPartitions)
+                            .mapPartitions(
+                                    serializedSplits ->
+                                            Collections.singletonList(
+                                                            exportSplits(
+                                                                    exportTable,
+                                                                    finalReadBuilder,
+                                                                    serializedSplits,
+                                                                    outputDir,
+                                                                    finalOutputType,
+                                                                    finalProjectedPredicate,
+                                                                    outputFieldCount,
+                                                                    finalCompression,
+                                                                    finalTargetFileSize))
+                                                    .iterator())
+                            .collect();
+        }
 
         long rows = 0L;
         for (Long count : counts) {
@@ -265,6 +303,85 @@ public class ExportParquetProcedure extends BaseProcedure {
             }
         }
         return count;
+    }
+
+    private static long exportSplits(
+            Table table,
+            ReadBuilder readBuilder,
+            Iterator<SerializedSplit> splits,
+            Path outputDir,
+            RowType outputType,
+            @Nullable Predicate predicate,
+            int outputFieldCount,
+            String compression,
+            long targetFileSize)
+            throws Exception {
+        TableRead read = readBuilder.newRead();
+        FileIO fileIO = outputFileIO(table, outputDir);
+        ProjectedRow outputRow = ProjectedRow.from(identityProjection(outputFieldCount));
+
+        long count = 0L;
+        try (RollingParquetWriter writer =
+                new RollingParquetWriter(fileIO, outputDir, outputType, compression)) {
+            while (splits.hasNext()) {
+                try (RecordReader<org.apache.paimon.data.InternalRow> reader =
+                                read.createReader(splits.next().split());
+                        CloseableIterator<org.apache.paimon.data.InternalRow> iterator =
+                                reader.toCloseableIterator()) {
+                    while (iterator.hasNext()) {
+                        org.apache.paimon.data.InternalRow row = iterator.next();
+                        if (predicate == null || predicate.test(row)) {
+                            writer.addElement(outputRow.replaceRow(row), targetFileSize);
+                            count++;
+                        }
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    private static int numPartitions(
+            int parallelism, int splitCount, List<Split> splits, @Nullable Long targetFileSize) {
+        int maxPartitions = Math.max(1, Math.min(parallelism, Math.max(1, splitCount)));
+        if (targetFileSize == null) {
+            return maxPartitions;
+        }
+
+        long totalSize = totalSplitSize(splits);
+        if (totalSize <= 0) {
+            return maxPartitions;
+        }
+
+        long targetPartitions = (totalSize + targetFileSize - 1) / targetFileSize;
+        return Math.max(
+                1, Math.min(maxPartitions, (int) Math.min(Integer.MAX_VALUE, targetPartitions)));
+    }
+
+    private static long totalSplitSize(List<Split> splits) {
+        long totalSize = 0L;
+        for (Split split : splits) {
+            totalSize += splitSize(split);
+        }
+        return totalSize;
+    }
+
+    private static long splitSize(Split split) {
+        long size = 0L;
+        if (split instanceof DataSplit) {
+            for (DataFileMeta file : ((DataSplit) split).dataFiles()) {
+                size += file.fileSize();
+            }
+        } else if (split instanceof IncrementalSplit) {
+            IncrementalSplit incrementalSplit = (IncrementalSplit) split;
+            for (DataFileMeta file : incrementalSplit.beforeFiles()) {
+                size += file.fileSize();
+            }
+            for (DataFileMeta file : incrementalSplit.afterFiles()) {
+                size += file.fileSize();
+            }
+        }
+        return size;
     }
 
     private static SerializedSplit serializeSplit(Split split) {
@@ -394,6 +511,12 @@ public class ExportParquetProcedure extends BaseProcedure {
             predicates.add(parseCondition(rowType, builder, condition));
         }
         return PredicateBuilder.and(predicates);
+    }
+
+    private static long parseTargetFileSize(String targetFileSize) {
+        long bytes = MemorySize.parse(targetFileSize).getBytes();
+        Preconditions.checkArgument(bytes > 0, "Target file size should be larger than 0 bytes.");
+        return bytes;
     }
 
     private static Predicate parseCondition(
@@ -694,6 +817,56 @@ public class ExportParquetProcedure extends BaseProcedure {
             } catch (IOException | ClassNotFoundException e) {
                 throw new RuntimeException("Failed to deserialize Paimon split.", e);
             }
+        }
+    }
+
+    private static class RollingParquetWriter implements AutoCloseable {
+
+        private final FileIO fileIO;
+        private final Path outputDir;
+        private final RowType outputType;
+        private final String compression;
+
+        private FormatWriter writer;
+
+        private RollingParquetWriter(
+                FileIO fileIO, Path outputDir, RowType outputType, String compression) {
+            this.fileIO = fileIO;
+            this.outputDir = outputDir;
+            this.outputType = outputType;
+            this.compression = compression;
+        }
+
+        private void addElement(org.apache.paimon.data.InternalRow row, long targetFileSize)
+                throws IOException {
+            if (writer == null) {
+                writer =
+                        new ParquetWriterFactory(
+                                        new RowDataParquetBuilder(outputType, new Options()))
+                                .create(
+                                        fileIO.newOutputStream(newOutputPath(), false),
+                                        compression);
+            }
+            writer.addElement(row);
+            if (writer.reachTargetSize(true, targetFileSize)) {
+                closeCurrentWriter();
+            }
+        }
+
+        private Path newOutputPath() {
+            return new Path(outputDir, "part-" + UUID.randomUUID() + ".parquet");
+        }
+
+        private void closeCurrentWriter() throws IOException {
+            if (writer != null) {
+                writer.close();
+                writer = null;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            closeCurrentWriter();
         }
     }
 

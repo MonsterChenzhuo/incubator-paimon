@@ -487,9 +487,10 @@ This section introduce all available spark procedures about paimon.
             <li>parallelism: export task parallelism. Left empty for Spark default parallelism.</li>
             <li>compression: Parquet compression codec. Left empty for zstd.</li>
             <li>overwrite: whether to overwrite the output directory. Left empty for false.</li>
+            <li>target_file_size: target Parquet file size, such as "128 MB". Left empty to keep one output file per Paimon split.</li>
       </td>
       <td>
-         CALL sys.export_parquet(table => "default.T", columns => "id,name", output_path => "s3://bucket/export/t", where => "dt = '2025-08-17' and id >= 10", parallelism => 100, compression => "zstd", overwrite => true)<br/>
+         CALL sys.export_parquet(table => "default.T", columns => "id,name", output_path => "s3://bucket/export/t", where => "dt = '2025-08-17' and id >= 10", parallelism => 100, compression => "zstd", overwrite => true, target_file_size => "128 MB")<br/>
          CALL sys.export_parquet(table => "default.T", columns => "*", output_path => "s3://bucket/export/t", overwrite => true)<br/>
       </td>
    </tr>
