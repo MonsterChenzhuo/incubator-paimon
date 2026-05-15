@@ -63,6 +63,27 @@ public class TableSchemaTest {
     }
 
     @Test
+    public void testLogicalRowTypeIsCached() {
+        TableSchema schema =
+                new TableSchema(
+                        1,
+                        singletonList(new DataField(0, "f0", DataTypes.INT())),
+                        10,
+                        emptyList(),
+                        emptyList(),
+                        new HashMap<>(),
+                        "");
+
+        assertThat(schema.logicalRowType()).isSameAs(schema.logicalRowType());
+    }
+
+    @Test
+    public void testDuplicateFields() {
+        assertThat(Schema.duplicateFields(Arrays.asList("f0", "f1", "f0", "f2", "f1", "f1")))
+                .containsExactlyInAnyOrder("f0", "f1");
+    }
+
+    @Test
     public void testCrossPartition() {
         List<DataField> fields =
                 Arrays.asList(

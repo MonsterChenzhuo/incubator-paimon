@@ -631,11 +631,14 @@ public class SchemaValidation {
             default:
         }
 
-        for (int i = 0; i < schema.logicalRowType().getFieldNames().size(); i++) {
-            String fieldName = schema.logicalRowType().getFieldNames().get(i);
+        RowType rowType = schema.logicalRowType();
+        List<String> fieldNames = rowType.getFieldNames();
+        String defaultAggFunc = options.fieldsDefaultFunc();
+        Set<String> discoveredAggFuncs = new HashSet<>();
+        for (String fieldName : fieldNames) {
             String aggFuncName = options.fieldAggFunc(fieldName);
-            aggFuncName = aggFuncName == null ? options.fieldsDefaultFunc() : aggFuncName;
-            if (aggFuncName != null) {
+            aggFuncName = aggFuncName == null ? defaultAggFunc : aggFuncName;
+            if (aggFuncName != null && discoveredAggFuncs.add(aggFuncName)) {
                 FactoryUtil.discoverFactory(
                         FieldAggregator.class.getClassLoader(),
                         FieldAggregatorFactory.class,

@@ -43,7 +43,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -219,13 +218,14 @@ public class Schema {
     }
 
     public static Set<String> duplicateFields(List<String> names) {
-        return names.stream()
-                .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()))
-                .entrySet()
-                .stream()
-                .filter(e -> e.getValue() > 1)
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toSet());
+        Set<String> seen = new HashSet<>();
+        Set<String> duplicates = new HashSet<>();
+        for (String name : names) {
+            if (!seen.add(name)) {
+                duplicates.add(name);
+            }
+        }
+        return duplicates;
     }
 
     @Override

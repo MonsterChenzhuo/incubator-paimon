@@ -75,6 +75,8 @@ public class TableSchema implements Serializable {
 
     private final long timeMillis;
 
+    private transient volatile RowType logicalRowType;
+
     public TableSchema(
             long id,
             List<DataField> fields,
@@ -248,7 +250,12 @@ public class TableSchema implements Serializable {
     }
 
     public RowType logicalRowType() {
-        return new RowType(fields);
+        RowType rowType = logicalRowType;
+        if (rowType == null) {
+            rowType = new RowType(fields);
+            logicalRowType = rowType;
+        }
+        return rowType;
     }
 
     public RowType logicalPartitionType() {
